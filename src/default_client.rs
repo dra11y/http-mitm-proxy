@@ -5,23 +5,27 @@ use hyper::{
     client, header, Request, Response, StatusCode, Uri, Version,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::{InvalidDnsNameError, ServerName};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::{net::TcpStream, task::JoinHandle};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("{0} doesn't have an valid host")]
+    #[error("{0} doesn't have a valid host")]
     InvalidHost(Uri),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]
-    NativeTlsError(#[from] tokio_native_tls::native_tls::Error),
+    RustlsError(#[from] rustls::Error),
+    #[error("Invalid server name {0}: {1}")]
+    InvalidServerName(String, InvalidDnsNameError),
     #[error(transparent)]
     HyperError(#[from] hyper::Error),
     #[error("Failed to connect to {0}, {1}")]
     ConnectError(Uri, hyper::Error),
     #[error("Failed to connect with TLS to {0}, {1}")]
-    TlsConnectError(Uri, native_tls::Error),
+    TlsConnectError(Uri, std::io::Error),
 }
 
 /// Upgraded connections
@@ -31,25 +35,34 @@ pub struct Upgraded {
     /// A socket to Server
     pub server: TokioIo<hyper::upgrade::Upgraded>,
 }
+
 #[derive(Clone)]
 /// Default HTTP client for this crate
 pub struct DefaultClient {
-    tls_connector_no_alpn: tokio_native_tls::TlsConnector,
-    tls_connector_alpn_h2: tokio_native_tls::TlsConnector,
+    tls_connector_no_alpn: tokio_rustls::TlsConnector,
+    tls_connector_alpn_h2: tokio_rustls::TlsConnector,
     /// If true, send_request will returns an Upgraded struct when the response is an upgrade
     /// If false, send_request never returns an Upgraded struct and just copy bidirectional when the response is an upgrade
     pub with_upgrades: bool,
 }
+
 impl DefaultClient {
-    pub fn new() -> native_tls::Result<Self> {
-        let tls_connector_no_alpn = native_tls::TlsConnector::builder().build()?;
-        let tls_connector_alpn_h2 = native_tls::TlsConnector::builder()
-            .request_alpns(&["h2", "http/1.1"])
-            .build()?;
+    pub fn new() -> Result<Self, Error> {
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config_no_alpn = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store.clone())
+            .with_no_client_auth();
+
+        let mut config_alpn_h2 = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        config_alpn_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         Ok(Self {
-            tls_connector_no_alpn: tokio_native_tls::TlsConnector::from(tls_connector_no_alpn),
-            tls_connector_alpn_h2: tokio_native_tls::TlsConnector::from(tls_connector_alpn_h2),
+            tls_connector_no_alpn: tokio_rustls::TlsConnector::from(Arc::new(config_no_alpn)),
+            tls_connector_alpn_h2: tokio_rustls::TlsConnector::from(Arc::new(config_alpn_h2)),
             with_upgrades: false,
         })
     }
@@ -61,7 +74,7 @@ impl DefaultClient {
         self
     }
 
-    fn tls_connector(&self, http_version: Version) -> &tokio_native_tls::TlsConnector {
+    fn tls_connector(&self, http_version: Version) -> &tokio_rustls::TlsConnector {
         match http_version {
             Version::HTTP_2 => &self.tls_connector_alpn_h2,
             _ => &self.tls_connector_no_alpn,
@@ -148,23 +161,28 @@ impl DefaultClient {
                 });
 
         let tcp = TcpStream::connect((host, port)).await?;
-        // This is actually needed to some servers
         let _ = tcp.set_nodelay(true);
 
         if uri.scheme() == Some(&hyper::http::uri::Scheme::HTTPS) {
-            let tls = self
-                .tls_connector(http_version)
-                .connect(host, tcp)
-                .await
-                .map_err(|err| Error::TlsConnectError(uri.clone(), err))?;
+            let server_name = ServerName::try_from(host.to_string())
+                .map_err(|e| Error::InvalidServerName(host.to_string(), e))?;
 
-            if let Ok(Some(true)) = tls
+            let tls_stream = self
+                .tls_connector(http_version)
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| Error::TlsConnectError(uri.clone(), e))?;
+
+            let is_h2 = tls_stream
                 .get_ref()
-                .negotiated_alpn()
-                .map(|a| a.map(|b| b == b"h2"))
-            {
+                .1
+                .alpn_protocol()
+                .map(|proto| proto == b"h2")
+                .unwrap_or(false);
+
+            if is_h2 {
                 let (sender, conn) = client::conn::http2::Builder::new(TokioExecutor::new())
-                    .handshake(TokioIo::new(tls))
+                    .handshake(TokioIo::new(tls_stream))
                     .await
                     .map_err(|err| Error::ConnectError(uri.clone(), err))?;
 
@@ -175,7 +193,7 @@ impl DefaultClient {
                 let (sender, conn) = client::conn::http1::Builder::new()
                     .preserve_header_case(true)
                     .title_case_headers(true)
-                    .handshake(TokioIo::new(tls))
+                    .handshake(TokioIo::new(tls_stream))
                     .await
                     .map_err(|err| Error::ConnectError(uri.clone(), err))?;
 
@@ -234,7 +252,6 @@ where
 
 impl<B> SendRequest<B> {
     #[allow(dead_code)]
-    // TODO: connection pooling
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), hyper::Error>> {
         match self {
             SendRequest::Http1(sender) => sender.poll_ready(cx),

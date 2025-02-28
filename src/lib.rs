@@ -17,7 +17,6 @@ use tokio_rustls::rustls;
 pub use futures;
 pub use hyper;
 pub use moka;
-pub use tokio_native_tls;
 
 pub mod default_client;
 mod tls;

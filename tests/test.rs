@@ -21,6 +21,12 @@ use moka::sync::Cache;
 
 static PORT: AtomicU16 = AtomicU16::new(3666);
 
+fn install_crypto_provider_if_needed() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}
+
 fn get_port() -> u16 {
     PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -73,6 +79,7 @@ fn client_tls(proxy_port: u16, cert: &rcgen::CertifiedKey) -> reqwest::Client {
 }
 
 fn proxy_client() -> DefaultClient {
+    install_crypto_provider_if_needed();
     DefaultClient::new().unwrap()
 }
 
